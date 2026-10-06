@@ -5,13 +5,15 @@ import crypto from 'crypto';
 import { fileURLToPath } from 'url';
 import { Server, Socket } from 'socket.io';
 import { Game, Bid, BidValue, GameType, Suit, SpecialGameType } from './src/types.js';
+import {
+  ALLOWED_PLAYER_COUNTS, MAX_PLAYERS, highestValue, isRoundOver, mayAct, mayUndo, numericValue,
+} from './src/rules.js';
 
 // Entwicklungsmodus nur explizit per `--dev` (siehe `npm run dev`).
 // Standard ist Produktion, damit nie versehentlich der Vite-Dev-Server öffentlich läuft.
 const isDev = process.argv.includes('--dev');
 
 // --- Limits ---
-const MAX_PLAYERS = 4;
 const MAX_GAMES = 1000;
 const MAX_BIDS_PER_GAME = 200;
 const MAX_NAME_LENGTH = 20;
@@ -114,12 +116,6 @@ function parseBidValue(value: unknown): BidValue | null {
   return null;
 }
 
-function numericBidValue(value: BidValue): number {
-  if (value === 'Match') return 157;
-  if (value === 'Pass') return -1;
-  return value;
-}
-
 function tokensEqual(a: string, b: string): boolean {
   const bufA = Buffer.from(a);
   const bufB = Buffer.from(b);
@@ -154,6 +150,7 @@ function publicGame(game: InternalGame): Game {
     bids: game.bids.map(b => ({ ...b })),
     creatorId: game.creatorId,
     started: game.started,
+    startIndex: game.startIndex,
   };
 }
 
@@ -280,6 +277,7 @@ async function createServer() {
         bids: [],
         creatorId: playerId,
         started: false,
+        startIndex: 0,
         lastActivity: Date.now(),
         rejoinTokens: new Map([[playerId, token]]),
       };
@@ -295,6 +293,7 @@ async function createServer() {
       const gameCode = parseGameCode(payload.gameCode);
       const game = gameCode ? games.get(gameCode) : undefined;
       if (!game) return sendError('Game not found');
+      if (game.started) return sendError('Game already started');
       if (game.players.length >= MAX_PLAYERS) return sendError('Game is full');
 
       game.lastActivity = Date.now();
@@ -327,19 +326,38 @@ async function createServer() {
       broadcastGameState(io, game.gameCode);
     });
 
+    // Der Ersteller legt vor dem Start die Sitz- und Bietreihenfolge fest
+    on('reorderPlayers', (payload) => {
+      const game = currentGame();
+      if (!game || game.creatorId !== session!.playerId || game.started) return;
+      const order = payload.order;
+      if (!Array.isArray(order) || order.length !== game.players.length) return sendError('Invalid order');
+      const byId = new Map(game.players.map(p => [p.id, p]));
+      if (new Set(order).size !== order.length || !order.every(id => typeof id === 'string' && byId.has(id))) {
+        return sendError('Invalid order');
+      }
+      game.players = order.map(id => byId.get(id as string)!);
+      game.lastActivity = Date.now();
+      broadcastGameState(io, game.gameCode);
+    });
+
     on('startGame', () => {
       const game = currentGame();
-      if (!game || game.creatorId !== session!.playerId) return;
+      if (!game || game.creatorId !== session!.playerId || game.started) return;
+      if (!ALLOWED_PLAYER_COUNTS.includes(game.players.length)) return sendError('Wrong player count');
       game.lastActivity = Date.now();
       game.started = true;
+      game.startIndex = 0;
+      game.bids = [];
       broadcastGameState(io, game.gameCode);
     });
 
     on('newRound', () => {
       const game = currentGame();
-      if (!game || game.creatorId !== session!.playerId) return;
+      if (!game || game.creatorId !== session!.playerId || !game.started) return;
       game.lastActivity = Date.now();
       game.bids = [];
+      game.startIndex = (game.startIndex + 1) % game.players.length;
       broadcastGameState(io, game.gameCode);
     });
 
@@ -347,6 +365,8 @@ async function createServer() {
       const game = currentGame();
       if (!game || !game.started) return;
       if (game.bids.length >= MAX_BIDS_PER_GAME) return sendError('Too many bids');
+      if (isRoundOver(game)) return sendError('Round is over');
+      if (!mayAct(game, session!.playerId)) return sendError('Not your turn');
 
       const value = parseBidValue(payload.value);
       if (value === null) return;
@@ -357,8 +377,7 @@ async function createServer() {
       } else {
         if (typeof payload.gameType !== 'string' || !VALID_GAME_TYPES.has(payload.gameType)) return;
         gameType = payload.gameType as GameType;
-        const highest = Math.max(0, ...game.bids.map(b => numericBidValue(b.value)));
-        if (numericBidValue(value) <= highest) return;
+        if (numericValue(value) <= highestValue(game.bids)) return sendError('Bid too low');
       }
 
       const player = game.players.find(p => p.id === session!.playerId);
@@ -373,12 +392,31 @@ async function createServer() {
 
     on('deleteLastBid', () => {
       const game = currentGame();
-      if (!game || !game.started || game.bids.length === 0) return;
-      const lastBid = game.bids[game.bids.length - 1];
-      if (lastBid.playerId !== session!.playerId) return;
+      if (!game || !mayUndo(game, session!.playerId)) return sendError('Cannot undo');
       game.lastActivity = Date.now();
       game.bids.pop();
       broadcastGameState(io, game.gameCode);
+    });
+
+    on('leaveGame', () => {
+      const game = currentGame();
+      if (!game || !session) return;
+      const { playerId } = session;
+      socket.leave(game.gameCode);
+      session = null;
+      // Vor dem Start wird der Platz frei. Nach dem Start bleibt der Spieler
+      // im Spiel, damit Gebotsverlauf und Zugregel konsistent bleiben.
+      if (!game.started) {
+        game.players = game.players.filter(p => p.id !== playerId);
+        game.rejoinTokens.delete(playerId);
+        if (game.players.length === 0) {
+          games.delete(game.gameCode);
+          return;
+        }
+        if (game.creatorId === playerId) game.creatorId = game.players[0].id;
+        game.lastActivity = Date.now();
+        broadcastGameState(io, game.gameCode);
+      }
     });
 
     socket.on('disconnect', () => {

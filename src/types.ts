@@ -32,4 +32,6 @@ export interface Game {
   bids: Bid[];
   creatorId: string;
   started: boolean;
+  // Index in players: wer die aktuelle Bietrunde beginnt (rotiert mit jeder neuen Runde)
+  startIndex: number;
 }

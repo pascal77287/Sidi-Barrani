@@ -2,523 +2,742 @@
  * @license
  * SPDX-License-Identifier: Apache-2.0
  */
-import { useState, useEffect, useRef } from 'react';
+import { useState, useEffect, useRef, useCallback, type FormEvent, type ReactNode } from 'react';
 import { io, Socket } from 'socket.io-client';
 import { QRCodeSVG } from 'qrcode.react';
-import { Share2, X, RotateCcw, Trash2 } from 'lucide-react';
+import {
+  ChevronDown, ChevronLeft, ChevronUp, Clock, LogOut, Minus, MoreVertical, Plus, QrCode, RotateCcw, Share2, Undo2, UserPlus, WifiOff,
+} from 'lucide-react';
 import { Suit, SpecialGameType, GameType } from './types';
-import type { Game, BidValue } from './types';
+import type { Bid, Game } from './types';
+import {
+  ALLOWED_PLAYER_COUNTS, MAX_PLAYERS, MIN_PLAY_VALUE, allowedValues, formatValue, highestBid,
+  currentPlayer, isPlayed, isRoundOver, mayAct, mayUndo, numericValue,
+} from './rules';
 
-const HomePage = ({ socket, setPlayerId, setGame, isConnected }: {
-  socket: Socket | null;
-  setPlayerId: (id: string) => void;
-  setGame: (game: Game) => void;
-  isConnected: boolean;
-}) => {
-  const [playerName, setPlayerName] = useState('');
+// --- Darstellung der Spielarten ---
+const SUITS: { type: GameType; icon: string; tint: string; border: string }[] = [
+  { type: Suit.ROSEN, icon: '/rose.svg', tint: '#FCECEA', border: '#B3261E' },
+  { type: Suit.EICHELN, icon: '/eichel.svg', tint: '#EAF3E8', border: '#2F6B2F' },
+  { type: Suit.SCHELLEN, icon: '/schellen.svg', tint: '#FBF1DC', border: '#9A6200' },
+  { type: Suit.SCHILTEN, icon: '/schilten.svg', tint: '#E8EEF9', border: '#1F4E99' },
+  { type: SpecialGameType.OBE_ABE, icon: '/obeabe.svg', tint: '#EDF0F2', border: '#46525C' },
+  { type: SpecialGameType.UNE_UFE, icon: '/uneufe.svg', tint: '#EDF0F2', border: '#46525C' },
+];
+const suitIcon = (type: GameType) => SUITS.find(s => s.type === type)?.icon ?? '';
+
+// Serverfehler auf Deutsch
+const ERROR_TEXT: Record<string, string> = {
+  'Game not found': 'Spiel nicht gefunden',
+  'Game is full': 'Das Spiel ist voll',
+  'Game already started': 'Das Spiel hat schon begonnen',
+  'Player not found in game': 'Sitzung abgelaufen – bitte neu beitreten',
+  'Invalid player name': 'Bitte gib einen Namen mit höchstens 20 Zeichen ein',
+  'Too many requests': 'Zu viele Anfragen – bitte kurz warten',
+  'Server is full': 'Der Server ist gerade ausgelastet',
+  'Too many bids': 'Zu viele Gebote in dieser Runde',
+  'Round is over': 'Die Bietrunde ist bereits entschieden',
+  'Not your turn': 'Du bist noch nicht wieder dran',
+  'Bid too low': 'Das Gebot ist zu tief',
+  'Cannot undo': 'Nicht mehr möglich – es wurde schon weiter geboten',
+  'Wrong player count': 'Gestartet wird mit 4 oder 6 Spielern',
+  'Invalid order': 'Die Reihenfolge konnte nicht gespeichert werden',
+};
+const SESSION_ERRORS = ['Game not found', 'Player not found in game'];
+
+const STORAGE_NAME = 'sidibarrani_name';
+const SESSION_KEYS = ['sidibarrani_playerId', 'sidibarrani_gameCode', 'sidibarrani_token'];
+
+function readStorage(storage: () => Storage, key: string): string | null {
+  try { return storage().getItem(key); } catch { return null; }
+}
+function writeStorage(storage: () => Storage, key: string, value: string | null) {
+  try {
+    if (value === null) storage().removeItem(key); else storage().setItem(key, value);
+  } catch { /* Speicher nicht verfügbar (z.B. privater Modus) */ }
+}
+const local = () => window.localStorage;
+const session = () => window.sessionStorage;
+
+const initial = (name: string) => name.trim().charAt(0).toUpperCase();
+const bidLabel = (bid: Bid) => (bid.value === 'Pass' ? 'Passe' : `${formatValue(bid.value)} ${bid.gameType}`);
+
+interface Toast { id: number; text: string }
+type ShowToast = (text: string) => void;
+
+// --- Kleine Bausteine ---
+const BottomSheet = ({ label, onClose, children }: { label: string; onClose: () => void; children: ReactNode }) => {
+  const panel = useRef<HTMLDivElement>(null);
+  // Fokus ins Sheet setzen, mit Escape schliessen
+  useEffect(() => {
+    panel.current?.focus();
+    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') onClose(); };
+    document.addEventListener('keydown', onKey);
+    return () => document.removeEventListener('keydown', onKey);
+  }, [onClose]);
+  return (
+    <div className="fixed inset-0 z-40 flex flex-col justify-end">
+      <button aria-label="Schliessen" onClick={onClose} className="absolute inset-0 bg-black/45" />
+      <div
+        ref={panel}
+        role="dialog"
+        aria-modal="true"
+        aria-label={label}
+        tabIndex={-1}
+        className="relative mx-auto w-full max-w-md bg-white rounded-t-[26px] px-5 pt-2.5 pb-[calc(2rem+env(safe-area-inset-bottom))] flex flex-col gap-3.5 outline-none"
+      >
+        <div className="w-10 h-[5px] rounded-full bg-line self-center" />
+        {children}
+      </div>
+    </div>
+  );
+};
+
+const Avatar = ({ name, size = 'md' }: { name: string; size?: 'sm' | 'md' }) => (
+  <div className={`${size === 'sm' ? 'w-7 h-7 text-[13px]' : 'w-9 h-9 text-[15px]'} shrink-0 rounded-full bg-accent text-white flex items-center justify-center font-bold`}>
+    {initial(name)}
+  </div>
+);
+
+// --- Startseite ---
+const HomePage = ({ socket, isConnected }: { socket: Socket | null; isConnected: boolean }) => {
+  const [playerName, setPlayerName] = useState(() => readStorage(local, STORAGE_NAME) ?? '');
   const [joinCode, setJoinCode] = useState('');
-  const [mode, setMode] = useState<'select' | 'create' | 'join'>('select');
 
   useEffect(() => {
-    const params = new URLSearchParams(window.location.search);
-    const joinParam = params.get('join');
-    if (joinParam) {
-      setJoinCode(joinParam);
-      setMode('join');
-    }
+    const joinParam = new URLSearchParams(window.location.search).get('join');
+    if (joinParam) setJoinCode(joinParam.toLowerCase().replace(/[^a-z0-9]/g, '').slice(0, 4));
   }, []);
 
-  const handleCreateGame = () => {
-    if (playerName.trim() && socket) {
-      socket.emit('createGame', { playerName });
-    }
+  const name = playerName.trim();
+  const canCreate = isConnected && name.length > 0;
+  const canJoin = canCreate && joinCode.length === 4;
+
+  const rememberName = () => writeStorage(local, STORAGE_NAME, name);
+
+  const handleCreate = (e?: FormEvent) => {
+    e?.preventDefault();
+    if (!canCreate || !socket) return;
+    rememberName();
+    socket.emit('createGame', { playerName: name });
   };
 
-  const handleJoinGame = () => {
-    if (playerName.trim() && joinCode.trim() && socket) {
-      socket.emit('joinGame', { playerName, gameCode: joinCode });
-      // clean up url after join
-      window.history.replaceState({}, document.title, window.location.pathname);
-    }
+  const handleJoin = (e?: FormEvent) => {
+    e?.preventDefault();
+    if (!canJoin || !socket) return;
+    rememberName();
+    socket.emit('joinGame', { playerName: name, gameCode: joinCode });
+    window.history.replaceState({}, document.title, window.location.pathname);
   };
 
   return (
-    <div className="p-4 bg-slate-50 min-h-screen flex flex-col items-center justify-center font-sans text-slate-900">
-      <div className="w-full max-w-sm bg-white p-6 rounded-xl border border-slate-200 shadow-sm">
-        <h1 className="text-3xl font-bold tracking-tight text-center mb-6 text-slate-900">Sidi Barrani</h1>
-        
-        {mode === 'select' && (
-          <div className="flex flex-col gap-4">
-            <button 
-              onClick={() => setMode('create')}
-              className="w-full bg-slate-900 text-white py-4 px-2 rounded-lg font-semibold hover:bg-slate-800 transition-colors"
-              disabled={!isConnected}
-            >
-              Neues Spiel eröffnen
-            </button>
-            <button 
-              onClick={() => setMode('join')}
-              className="w-full bg-white text-slate-800 border border-slate-300 py-4 px-2 rounded-lg font-semibold hover:bg-slate-50 transition-colors"
-              disabled={!isConnected}
-            >
-              Einem Spiel beitreten
-            </button>
-            {!isConnected && (
-              <p className="text-center text-red-500 text-sm">Verbindung zum Server wird aufgebaut...</p>
-            )}
-          </div>
-        )}
-
-        {mode === 'create' && (
-          <div className="flex flex-col">
-            <h2 className="text-lg font-semibold mb-4 text-center">Spiel eröffnen</h2>
-            <input
-              type="text"
-              value={playerName}
-              onChange={(e) => setPlayerName(e.target.value)}
-              placeholder="Dein Name"
-              maxLength={20}
-              className="w-full p-3 border border-slate-300 rounded-lg mb-4 focus:ring-1 focus:ring-slate-900 focus:border-slate-900 outline-none transition-all"
-              autoFocus
-            />
-            <button 
-              onClick={handleCreateGame} 
-              className="w-full bg-slate-900 text-white p-3 rounded-lg font-semibold hover:bg-slate-800 disabled:opacity-50 disabled:cursor-not-allowed mb-4 transition-colors" 
-              disabled={!isConnected || !playerName.trim()}
-            >
-              Spiel erstellen
-            </button>
-            <button 
-              onClick={() => setMode('select')}
-              className="text-gray-500 hover:text-gray-700 text-sm font-medium"
-            >
-              &larr; Zurück
-            </button>
-          </div>
-        )}
-
-        {mode === 'join' && (
-          <div className="flex flex-col">
-            <h2 className="text-lg font-semibold mb-4 text-center">Spiel beitreten</h2>
-            <input
-              type="text"
-              value={playerName}
-              onChange={(e) => setPlayerName(e.target.value)}
-              placeholder="Dein Name"
-              maxLength={20}
-              className="w-full p-3 border border-slate-300 rounded-lg mb-4 focus:ring-1 focus:ring-slate-900 focus:border-slate-900 outline-none transition-all"
-              autoFocus
-            />
-            <input
-              type="text"
-              value={joinCode}
-              onChange={(e) => setJoinCode(e.target.value.toLowerCase())}
-              placeholder="4-stelliger Spiel-Code"
-              className="w-full p-3 border border-slate-300 rounded-lg mb-4 focus:ring-1 focus:ring-slate-900 focus:border-slate-900 outline-none text-center font-mono text-xl tracking-widest transition-all uppercase"
-              maxLength={4}
-            />
-            <button 
-              onClick={handleJoinGame} 
-              className="w-full bg-slate-900 text-white p-3 rounded-lg font-semibold hover:bg-slate-800 disabled:opacity-50 disabled:cursor-not-allowed mb-4 transition-colors" 
-              disabled={!isConnected || !playerName.trim() || !joinCode.trim()}
-            >
-              Beitreten
-            </button>
-            <button 
-              onClick={() => setMode('select')}
-              className="text-gray-500 hover:text-gray-700 text-sm font-medium"
-            >
-              &larr; Zurück
-            </button>
-          </div>
-        )}
+    <div className="min-h-dvh max-w-md mx-auto flex flex-col gap-7 px-5 pt-14 pb-[calc(1.75rem+env(safe-area-inset-bottom))]">
+      <div className="flex flex-col items-center gap-2.5 pt-6">
+        <div className="w-16 h-16 rounded-[18px] bg-accent flex items-center justify-center">
+          <svg width="34" height="34" viewBox="0 0 24 24" fill="none" stroke="#FFFFFF" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+            <rect x="3" y="5" width="11" height="15" rx="2" />
+            <path d="M10 4.2l7.6-1.1a2 2 0 0 1 2.3 1.7l1.6 11.5a2 2 0 0 1-1.7 2.3L17 19" />
+          </svg>
+        </div>
+        <h1 className="m-0 text-[32px] font-extrabold tracking-tight">Sidi Barrani</h1>
+        <p className="m-0 text-muted">Biet-Hilfe für eure Jassrunde</p>
       </div>
+
+      <form onSubmit={handleCreate} className="flex flex-col gap-7">
+        <div className="flex flex-col gap-2">
+          <label htmlFor="name" className="text-sm font-semibold text-ink-2">Dein Name</label>
+          <input
+            id="name"
+            type="text"
+            value={playerName}
+            onChange={e => setPlayerName(e.target.value.slice(0, 20))}
+            placeholder="z.B. Anna"
+            maxLength={20}
+            autoComplete="nickname"
+            enterKeyHint="go"
+            className="h-14 px-4 border-[1.5px] border-line-strong rounded-[14px] bg-white text-lg outline-none focus:border-accent focus:ring-2 focus:ring-accent/30"
+          />
+          <span className="text-[13px] text-muted">Wird auf diesem Gerät gemerkt.</span>
+        </div>
+        <button
+          type="submit"
+          disabled={!canCreate}
+          className="press h-[58px] rounded-[14px] bg-accent disabled:bg-disabled text-white text-lg font-bold"
+        >
+          Neues Spiel eröffnen
+        </button>
+      </form>
+
+      <div className="flex items-center gap-3 text-sm text-muted">
+        <div className="flex-1 h-px bg-line-strong" />
+        <span>oder mit Code beitreten</span>
+        <div className="flex-1 h-px bg-line-strong" />
+      </div>
+
+      <form onSubmit={handleJoin} className="flex gap-2.5">
+        <label htmlFor="code" className="sr-only">Spiel-Code</label>
+        <input
+          id="code"
+          type="text"
+          value={joinCode.toUpperCase()}
+          onChange={e => setJoinCode(e.target.value.toLowerCase().replace(/[^a-z0-9]/g, '').slice(0, 4))}
+          placeholder="CODE"
+          maxLength={4}
+          autoCapitalize="characters"
+          autoCorrect="off"
+          spellCheck={false}
+          enterKeyHint="go"
+          className="num flex-1 min-w-0 h-[58px] px-3 border-[1.5px] border-line-strong rounded-[14px] bg-white text-2xl font-bold tracking-[0.3em] text-center outline-none focus:border-accent focus:ring-2 focus:ring-accent/30"
+        />
+        <button
+          type="submit"
+          disabled={!canJoin}
+          className="press w-[130px] h-[58px] rounded-[14px] border-[1.5px] border-accent disabled:border-line-strong bg-white text-accent disabled:text-disabled text-[17px] font-bold"
+        >
+          Beitreten
+        </button>
+      </form>
+
+      <div className="flex-1" />
+      {!isConnected && (
+        <p className="m-0 text-center text-sm text-danger-ink">Verbindung zum Server wird aufgebaut …</p>
+      )}
     </div>
   );
 };
 
-const GamePage = ({ game, playerId, socket }: { game: Game, playerId: string, socket: Socket | null }) => {
-  const isCreator = game.creatorId === playerId;
-  const [showShareModal, setShowShareModal] = useState(false);
+// --- Einladen ---
+const InviteSheet = ({ gameCode, onClose, showToast }: { gameCode: string; onClose: () => void; showToast: ShowToast }) => {
+  const shareUrl = `${window.location.origin}/?join=${gameCode}`;
 
-  const handleStartGame = () => {
-    if (socket) {
-      socket.emit('startGame');
-    }
-  };
-
-  const shareUrl = `${window.location.origin}?join=${game.gameCode}`;
-
-  const handleShareClick = () => {
-    if (navigator.share) {
-      navigator.share({
-        title: 'Sidi Barrani',
-        text: `Komm und spiel Sidi Barrani! Code: ${game.gameCode}`,
-        url: shareUrl,
-      }).catch(console.error);
-    } else {
-      setShowShareModal(true);
+  const handleShare = async () => {
+    try {
+      if (navigator.share) {
+        await navigator.share({ title: 'Sidi Barrani', text: `Komm und spiel Sidi Barrani! Code: ${gameCode.toUpperCase()}`, url: shareUrl });
+      } else {
+        await navigator.clipboard.writeText(shareUrl);
+        showToast('Link kopiert');
+      }
+      onClose();
+    } catch {
+      // Teilen abgebrochen
     }
   };
 
   return (
-    <div className="p-4 bg-slate-50 min-h-screen flex flex-col items-center font-sans text-slate-900">
-      <div className="w-full max-w-md bg-white p-6 rounded-xl border border-slate-200 shadow-sm relative">
-        {showShareModal && (
-          <div 
-            className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50 p-4"
-            onClick={() => setShowShareModal(false)}
-          >
-            <div 
-              className="bg-white p-6 rounded-xl shadow-xl flex flex-col items-center max-w-sm w-full relative"
-              onClick={e => e.stopPropagation()}
-            >
-              <button 
-                onClick={() => setShowShareModal(false)} 
-                className="absolute top-4 right-4 text-gray-400 hover:text-gray-600 transition-colors"
-                title="Schliessen"
-              >
-                <X size={24} />
-              </button>
-              <h3 className="text-xl font-bold mb-4">Spiel einladen</h3>
-              <p className="text-gray-600 mb-6 text-center">Scan den Code oder teile den Link mit deinen Freunden</p>
-              <div className="bg-slate-50 p-4 rounded-lg border border-slate-200 mb-6 flex justify-center items-center">
-                 <QRCodeSVG value={shareUrl} size={200} />
-              </div>
-              <p className="font-mono text-2xl font-bold tracking-widest mb-6 text-slate-900 uppercase">{game.gameCode}</p>
-              <div className="flex gap-2 w-full">
-                {navigator.share ? (
-                  <button onClick={handleShareClick} className="w-full bg-slate-900 text-white p-3 rounded-lg font-semibold hover:bg-slate-800 flex items-center justify-center gap-2 transition-colors">
-                    <Share2 size={18} /> Teilen
-                  </button>
-                ) : (
-                  <button onClick={() => setShowShareModal(false)} className="w-full bg-white border border-slate-300 text-slate-800 p-3 rounded-lg font-semibold hover:bg-slate-50 transition-colors">Schliessen</button>
+    <BottomSheet label="Spieler einladen" onClose={onClose}>
+      <div className="flex flex-col items-center gap-3.5">
+        <h2 className="m-0 text-xl font-extrabold">Spieler einladen</h2>
+        <div className="p-3 rounded-[18px] border border-line bg-white">
+          <QRCodeSVG value={shareUrl} size={184} />
+        </div>
+        <span className="num text-4xl font-extrabold tracking-[0.18em] pl-[0.18em] uppercase">{gameCode}</span>
+        <button onClick={handleShare} className="press w-full h-14 rounded-[14px] bg-accent text-white text-[17px] font-bold flex items-center justify-center gap-2.5">
+          <Share2 size={20} /> Link teilen
+        </button>
+      </div>
+    </BottomSheet>
+  );
+};
+
+// --- Lobby ---
+const LobbyPage = ({ game, playerId, socket, onInvite, onLeave }: {
+  game: Game; playerId: string; socket: Socket | null; onInvite: () => void; onLeave: () => void;
+}) => {
+  const isCreator = game.creatorId === playerId;
+  const creatorName = game.players.find(p => p.id === game.creatorId)?.name ?? 'den Ersteller';
+  const count = game.players.length;
+  const canStart = ALLOWED_PLAYER_COUNTS.includes(count);
+  const startLabel = count < 4 ? `Warte auf Mitspieler … (${count}/4)`
+    : count === 4 ? 'Mit 4 Spielern starten'
+    : count === 5 ? 'Für 6 Spieler fehlt noch 1'
+    : 'Mit 6 Spielern starten';
+
+  const slots = Array.from({ length: MAX_PLAYERS }, (_, i) => game.players[i] ?? null);
+
+  // Spieler um eine Position verschieben (nur Ersteller, vor dem Start)
+  const move = (index: number, dir: -1 | 1) => {
+    const target = index + dir;
+    if (target < 0 || target >= count) return;
+    const order = game.players.map(p => p.id);
+    [order[index], order[target]] = [order[target], order[index]];
+    socket?.emit('reorderPlayers', { order });
+  };
+
+  return (
+    <div className="h-dvh max-w-md mx-auto flex flex-col">
+      <div className="h-[60px] shrink-0 flex items-center justify-between pl-2 pr-3">
+        <button onClick={onLeave} aria-label="Spiel verlassen" className="press w-11 h-11 rounded-xl flex items-center justify-center">
+          <ChevronLeft size={24} />
+        </button>
+        <span className="font-bold text-[17px]">Lobby</span>
+        <div className="w-11" />
+      </div>
+
+      <div className="flex-1 overflow-y-auto px-5 pt-1 pb-5 flex flex-col gap-5">
+        <div className="bg-white rounded-[22px] border border-line px-5 py-5 flex flex-col items-center gap-1.5">
+          <span className="text-[13px] font-semibold text-muted uppercase tracking-[0.08em]">Spiel-Code</span>
+          <span className="num text-[52px] font-extrabold tracking-[0.18em] pl-[0.18em] uppercase">{game.gameCode}</span>
+          <button onClick={onInvite} className="press mt-2.5 w-full h-[52px] rounded-[14px] bg-accent-tint text-accent-ink text-[17px] font-bold flex items-center justify-center gap-2.5">
+            <QrCode size={20} /> Spieler einladen
+          </button>
+        </div>
+
+        <div className="flex flex-col gap-2.5">
+          <div className="flex justify-between items-baseline">
+            <h2 className="m-0 text-[15px] font-bold">Reihenfolge</h2>
+            <span className="num text-sm text-muted">{count} Spieler · Start mit 4 oder 6</span>
+          </div>
+          <p className="m-0 -mt-1 text-[13px] text-muted">
+            {isCreator
+              ? 'Ordne die Spieler so, wie ihr am Tisch sitzt. Geboten wird reihum in dieser Reihenfolge, Nr. 1 beginnt.'
+              : 'Geboten wird reihum in dieser Reihenfolge. Der Ersteller legt sie vor dem Start fest.'}
+          </p>
+          {slots.map((p, i) => p ? (
+            <div key={p.id} className="h-[60px] flex items-center gap-2.5 pl-3 pr-1.5 rounded-2xl bg-white border border-line">
+              <span className="num w-5 text-center text-[15px] font-bold text-muted">{i + 1}</span>
+              <Avatar name={p.name} />
+              <div className="flex-1 min-w-0 flex flex-col leading-tight">
+                <span className="font-semibold text-[17px] truncate">{p.name}</span>
+                {(p.id === playerId || p.id === game.creatorId) && (
+                  <span className="text-xs text-muted">
+                    {[p.id === playerId && 'Du', p.id === game.creatorId && 'Ersteller'].filter(Boolean).join(' · ')}
+                  </span>
                 )}
               </div>
+              {isCreator && (
+                <div className="flex gap-1">
+                  <button onClick={() => move(i, -1)} disabled={i === 0} aria-label={`${p.name} nach oben`} className="press w-11 h-11 rounded-xl bg-neutral-soft text-ink disabled:text-line-strong flex items-center justify-center">
+                    <ChevronUp size={22} />
+                  </button>
+                  <button onClick={() => move(i, 1)} disabled={i === count - 1} aria-label={`${p.name} nach unten`} className="press w-11 h-11 rounded-xl bg-neutral-soft text-ink disabled:text-line-strong flex items-center justify-center">
+                    <ChevronDown size={22} />
+                  </button>
+                </div>
+              )}
             </div>
-          </div>
-        )}
-
-        <div className="flex flex-col gap-3 mb-4">
-          <div className="flex justify-between items-center">
-            <h1 className="text-xl font-bold flex items-center gap-2">
-              Spiel: 
-              <button 
-                onClick={() => setShowShareModal(true)} 
-                className="flex items-center gap-2 bg-slate-100 text-slate-800 px-3 py-1 rounded hover:bg-slate-200 transition-colors cursor-pointer group"
-                title="Spiel teilen"
-              >
-                <span className="font-mono tracking-wider uppercase text-sm font-semibold">{game.gameCode}</span>
-                <Share2 size={16} className="text-slate-400 group-hover:text-slate-600" />
-              </button>
-            </h1>
-          </div>
-          <div className="flex gap-2">
-            {isCreator && !game.started && (
-              <button onClick={handleStartGame} className="w-full bg-slate-900 text-white px-4 py-2 rounded-lg font-semibold hover:bg-slate-800 transition-colors">
-                Spiel starten
-              </button>
-            )}
-          </div>
+          ) : (
+            <div key={`empty-${i}`} className="h-[60px] flex items-center gap-2.5 pl-3 pr-3.5 rounded-2xl border-[1.5px] border-dashed border-line-strong text-muted">
+              <span className="num w-5 text-center text-[15px] font-bold">{i + 1}</span>
+              <div className="w-9 h-9 rounded-full border-[1.5px] border-dashed border-line-strong" />
+              <span>{i < 4 ? 'Freier Platz' : `Platz ${i + 1} · optional`}</span>
+            </div>
+          ))}
         </div>
+      </div>
 
-        <div className="mb-4">
-          <h2 className="text-sm font-bold uppercase tracking-wider border-b border-slate-200 pb-2 mb-3 px-1 flex items-center justify-between text-slate-500">Spieler</h2>
-          <div className="grid grid-cols-2 gap-2">
-            {game.players.map(p => (
-              <div key={p.id} className={`px-3 py-2 rounded-lg bg-white border flex items-center justify-between ${p.id === playerId ? 'font-semibold text-slate-900 border-slate-800 bg-slate-50' : 'text-slate-600 border-slate-200'}`}>
-                <span className="truncate text-sm">{p.name}</span>
-                {p.id === game.creatorId && <span className="text-[9px] uppercase tracking-wider text-slate-400 border border-slate-200 bg-white px-1.5 py-0.5 rounded ml-2">Ersteller</span>}
-              </div>
-            ))}
-          </div>
-        </div>
-
-        {game.started ? (
-          <BiddingComponent game={game} playerId={playerId} socket={socket} />
+      <div className="shrink-0 bg-white border-t border-line px-5 pt-3.5 pb-[calc(1.75rem+env(safe-area-inset-bottom))]">
+        {isCreator ? (
+          <button
+            onClick={() => socket?.emit('startGame')}
+            disabled={!canStart}
+            className="press w-full h-[58px] rounded-[14px] bg-accent disabled:bg-disabled text-white text-lg font-bold"
+          >
+            {startLabel}
+          </button>
         ) : (
-          <div className="text-center text-gray-500">Das Spiel hat noch nicht begonnen.</div>
+          <div className="h-[58px] flex items-center justify-center gap-2.5 text-ink-2">
+            <Clock size={20} /> Warte auf {creatorName}, bis das Spiel startet …
+          </div>
         )}
       </div>
     </div>
   );
 };
 
-const BiddingComponent = ({ game, playerId, socket }: { game: Game, playerId: string, socket: Socket | null }) => {
-  const [bidValue, setBidValue] = useState<number | 'Match' | ''>('');
-  const [errorMsg, setErrorMsg] = useState('');
+// --- Spiel ---
+const GamePage = ({ game, playerId, socket, isConnected, onInvite, onMenu }: {
+  game: Game; playerId: string; socket: Socket | null; isConnected: boolean;
+  onInvite: () => void; onMenu: () => void;
+}) => {
+  const [pick, setPick] = useState<number | 'Match' | null>(null);
+  const [flashId, setFlashId] = useState<string | null>(null);
+  const prevBidCount = useRef(game.bids.length);
 
   const isCreator = game.creatorId === playerId;
-
-  const handleNewRound = () => {
-    if (socket) {
-      socket.emit('newRound');
+  const best = highestBid(game.bids);
+  const over = isRoundOver(game);
+  const played = isPlayed(game);
+  const myTurn = mayAct(game, playerId);
+  const canUndo = mayUndo(game, playerId);
+  const lastBid = game.bids[game.bids.length - 1];
+  const turn = currentPlayer(game);
+  const starterId = game.players[game.startIndex % game.players.length]?.id;
+  // Wer kommt noch vor mir an die Reihe?
+  const beforeMe: string[] = [];
+  if (turn) {
+    const n = game.players.length;
+    for (let i = game.players.indexOf(turn); game.players[i % n].id !== playerId && beforeMe.length < n; i++) {
+      beforeMe.push(game.players[i % n].name);
     }
-  };
+  }
+  const creatorName = game.players.find(p => p.id === game.creatorId)?.name ?? 'den Ersteller';
 
-  const handleDeleteLastBid = () => {
-    if (socket) {
-      socket.emit('deleteLastBid');
-    }
-  };
+  const allowed = allowedValues(game.bids);
+  const value = pick !== null && allowed.includes(pick) ? pick : allowed[0] ?? null;
+  const valueIndex = value === null ? -1 : allowed.indexOf(value);
 
-  // Helper zum Vergleich von Werten
-  const getNumericValue = (val: BidValue): number => {
-    if (val === 'Match') return 157;
-    if (val === 'Pass') return -1;
-    return val as number;
-  };
-
-  // Höchstes aktuelles Gebat finden (Pass ignorieren)
-  const currentHighestValue = Math.max(
-    ...game.bids
-      .filter(b => b.value !== 'Pass')
-      .map(b => getNumericValue(b.value)),
-    0
-  );
-
-  // Liste aller möglichen Werte
-  const allValues: (number | 'Match')[] = [
-    ...Array.from({ length: 15 }, (_, i) => (i + 1) * 10),
-    'Match'
-  ];
-
-  // Nur Werte erlauben, die höher als das aktuelle Gebot sind
-  const availableValues = allValues.filter(val => getNumericValue(val) > currentHighestValue);
-
-  // Automatische Vorauswahl des nächsten Wertes
+  // Neue Gebote anderer kurz hervorheben (und leicht vibrieren)
   useEffect(() => {
-    if (availableValues.length > 0) {
-      // Wenn nichts gewählt oder das Gewählte nicht mehr gültig ist: Nächsthöheren wählen
-      if (bidValue === '' || getNumericValue(bidValue) <= currentHighestValue) {
-        setBidValue(availableValues[0]);
-      }
-    } else if (currentHighestValue >= 157) {
-      setBidValue('');
+    if (game.bids.length > prevBidCount.current) {
+      const latest = game.bids[game.bids.length - 1];
+      setFlashId(latest.playerId);
+      if (latest.playerId !== playerId) navigator.vibrate?.(30);
+      const t = setTimeout(() => setFlashId(null), 1300);
+      prevBidCount.current = game.bids.length;
+      return () => clearTimeout(t);
     }
-  }, [currentHighestValue, availableValues, bidValue]);
+    prevBidCount.current = game.bids.length;
+  }, [game.bids, playerId]);
 
-  const handleBid = (type: GameType | 'Pass') => {
-    if (!socket) return;
-    setErrorMsg('');
-
-    // Spieler und Spiel ermittelt der Server aus der Verbindung
-    if (type === 'Pass') {
-      socket.emit('placeBid', { value: 'Pass' });
-      return;
-    }
-
-    if (bidValue === '') {
-      setErrorMsg('Bitte wähle zuerst einen Wert.');
-      return;
-    }
-
-    socket.emit('placeBid', { gameType: type, value: bidValue });
+  const placeBid = (gameType: GameType) => {
+    if (!socket || value === null || !myTurn || !isConnected) return;
+    socket.emit('placeBid', { gameType, value });
+    setPick(null);
   };
 
-  const getSuitDisplay = (suit: string) => {
-    const baseClass = "bg-white border border-slate-300 text-slate-700 hover:border-slate-800 hover:text-slate-900";
-    switch (suit) {
-      case 'Eicheln': return { color: baseClass, label: 'Eicheln', icon: '/eichel.svg' };
-      case 'Schellen': return { color: baseClass, label: 'Schellen', icon: '/schellen.svg' };
-      case 'Schilten': return { color: baseClass, label: 'Schilten', icon: '/schilten.svg' };
-      case 'Rosen': return { color: baseClass, label: 'Rosen', icon: '/rose.svg' };
-      case 'Obeabe': return { color: baseClass, label: 'Obeabe', icon: '/obeabe.svg' };
-      case 'Uneufe': return { color: baseClass, label: 'Uneufe', icon: '/uneufe.svg' };
-      default: return { color: baseClass, label: suit, icon: '' };
-    }
+  const pass = () => {
+    if (!socket || !myTurn || !isConnected) return;
+    socket.emit('placeBid', { value: 'Pass' });
   };
+
+  const undoAndEdit = () => {
+    if (lastBid && lastBid.value !== 'Pass') setPick(lastBid.value);
+    socket?.emit('deleteLastBid');
+  };
+
+  const step = (dir: number) => {
+    const next = allowed[valueIndex + dir];
+    if (next !== undefined) setPick(next);
+  };
+
+  // Info-Box über den Spielern
+  let banner: { style: string; overline: string; title: string; sub: string; icon?: string };
+  if (over && !played) {
+    banner = {
+      style: 'bg-warn-bg text-warn-ink', overline: 'Bietrunde beendet', title: 'Nicht gespielt',
+      sub: best ? `Höchstgebot ${formatValue(best.value)} liegt unter ${MIN_PLAY_VALUE}` : 'Alle haben gepasst',
+    };
+  } else if (best) {
+    const byMe = best.playerId === playerId;
+    banner = {
+      style: over ? 'bg-accent text-white' : 'bg-accent-banner text-ink',
+      overline: over ? 'Bietrunde beendet' : 'Höchstgebot',
+      title: `${formatValue(best.value)} ${best.gameType}`,
+      sub: over
+        ? (byMe ? 'Du spielst' : `${best.playerName} spielt`)
+        : `von ${byMe ? 'dir' : best.playerName}${numericValue(best.value) < MIN_PLAY_VALUE ? ` · gespielt wird ab ${MIN_PLAY_VALUE}` : ''}`,
+      icon: suitIcon(best.gameType),
+    };
+  } else {
+    banner = { style: 'bg-accent-idle text-ink', overline: 'Höchstgebot', title: 'Noch kein Gebot', sub: `Gespielt wird ab ${MIN_PLAY_VALUE}` };
+  }
+
+  const myLast = lastBid && lastBid.playerId === playerId ? lastBid : null;
 
   return (
-    <div>
-      <h2 className="text-sm font-bold uppercase tracking-wider border-b border-slate-200 pb-2 mb-3 px-1 flex items-center justify-between text-slate-500">Bieten</h2>
-      <div className="flex gap-2 mb-3">
-        <select 
-          value={bidValue} 
-          onChange={e => {
-            const val = e.target.value;
-            setBidValue(val === 'Match' ? 'Match' : Number(val));
-          }} 
-          className="w-full p-3 border border-slate-300 rounded-lg bg-white font-semibold outline-none focus:border-slate-900 focus:ring-1 focus:ring-slate-900 text-slate-900 transition-colors" 
-          disabled={availableValues.length === 0}
-        >
-          <option value="" disabled>Wert wählen...</option>
-          {availableValues.map(val => (
-            <option key={val} value={val}>{val === 'Match' ? 'Match (157)' : val}</option>
-          ))}
-        </select>
-      </div>
-
-      <div className="grid grid-cols-4 gap-1 mb-2">
-        {(Object.values(Suit) as GameType[]).map(gt => {
-          const display = getSuitDisplay(gt as string);
-          return (
-            <button 
-              key={gt} 
-              onClick={() => handleBid(gt)} 
-              disabled={availableValues.length === 0 || bidValue === ''}
-              className={`p-2 min-h-[44px] rounded-lg font-semibold text-[11px] sm:text-xs transition-all active:scale-95 text-center break-words leading-tight flex flex-col gap-1 items-center justify-center disabled:opacity-40 disabled:cursor-not-allowed ${display.color}`}
-            >
-              {display.icon && <img src={display.icon} alt={display.label} className="w-6 h-6 object-contain pointer-events-none" />}
-              <span>{display.label}</span>
-            </button>
-          );
-        })}
-      </div>
-      
-      <div className="grid grid-cols-4 gap-1 mb-6">
-        {(Object.values(SpecialGameType) as GameType[]).map(gt => {
-          const display = getSuitDisplay(gt as string);
-          return (
-            <button 
-              key={gt} 
-              onClick={() => handleBid(gt)} 
-              disabled={availableValues.length === 0 || bidValue === ''}
-              className={`p-2 min-h-[44px] rounded-lg font-semibold text-[11px] sm:text-xs transition-all active:scale-95 text-center break-words leading-tight flex flex-col gap-1 items-center justify-center disabled:opacity-40 disabled:cursor-not-allowed ${display.color}`}
-            >
-              {display.icon && <img src={display.icon} alt={display.label} className="w-6 h-6 object-contain pointer-events-none" />}
-              <span>{display.label}</span>
-            </button>
-          );
-        })}
-        <button 
-          onClick={() => handleBid('Pass')} 
-          className="col-span-2 bg-slate-100 border border-slate-200 text-slate-700 p-2 min-h-[44px] rounded-lg font-semibold text-[11px] sm:text-xs hover:bg-slate-200 hover:text-slate-900 transition-all active:scale-95 flex items-center justify-center"
-        >
-          Ich passe
+    <div className="h-dvh max-w-md mx-auto flex flex-col">
+      {/* Kopfzeile */}
+      <div className="h-[60px] shrink-0 flex items-center gap-2 pl-3.5 pr-2">
+        <button onClick={onInvite} aria-label="Spiel-Code teilen" className="press num h-11 px-3 rounded-xl border border-line bg-white flex items-center gap-2 font-extrabold tracking-[0.12em] uppercase">
+          {game.gameCode}
+          <Share2 size={16} className="text-muted" />
+        </button>
+        <div className="flex-1" />
+        <span className={`h-11 px-3 rounded-full flex items-center gap-2 text-sm font-semibold ${isConnected ? 'bg-neutral-btn text-ink-2' : 'bg-danger-bg text-danger-ink'}`}>
+          <span className={`w-2 h-2 rounded-full ${isConnected ? 'bg-online' : 'bg-offline'}`} />
+          {isConnected ? 'Verbunden' : 'Offline'}
+        </span>
+        <button onClick={onMenu} aria-label="Menü" className="press w-11 h-11 rounded-xl flex items-center justify-center">
+          <MoreVertical size={22} />
         </button>
       </div>
 
-      {errorMsg && <p className="text-red-600 text-sm font-medium mb-3 text-center bg-red-50 p-2 rounded-lg border border-red-100">{errorMsg}</p>}
-
-      <div className="mt-8">
-        <h3 className="text-sm font-bold uppercase tracking-wider border-b border-slate-200 pb-2 mb-3 px-1 flex items-center justify-between text-slate-500">
-          <span>Aktuelle Gebote</span>
-          {isCreator && (
-            <button 
-              onClick={handleNewRound} 
-              className="text-xs font-semibold text-slate-500 hover:text-slate-900 flex items-center gap-1 transition-colors"
-            >
-              <RotateCcw size={14} /> <span>Neue Runde</span>
-            </button>
-          )}
-        </h3>
-        <div className="space-y-2">
-          {game.bids.length === 0 ? (
-            <p className="text-slate-400 italic text-center py-4 bg-slate-50 rounded-lg text-sm border border-slate-100">Noch keine Gebote vorhanden</p>
-          ) : (
-            [...game.bids].reverse().map((b, index, arr) => {
-              const originalIndex = arr.length - 1 - index;
-              const isLastBid = originalIndex === game.bids.length - 1;
-              const canDelete = isLastBid && b.playerId === playerId;
-
-              return (
-                <div 
-                  key={originalIndex} 
-                  className={`p-3 rounded-lg border flex justify-between items-center transition-colors ${
-                    b.playerId === playerId ? 'bg-slate-50 border-slate-800 text-slate-900' : 'bg-white border-slate-200 text-slate-700'
-                  } ${b.value === 'Pass' ? 'opacity-60' : ''}`}
-                >
-                  <span className="font-semibold text-sm">{b.playerName}</span>
-                  <div className="flex items-center gap-3">
-                    <span className={`px-2 py-0.5 rounded text-xs font-mono font-medium border ${b.value === 'Pass' ? 'bg-slate-100 border-slate-200 text-slate-500' : 'bg-white border-slate-300 text-slate-900'}`}>
-                      {b.value === 'Pass' ? 'Passe' : `${b.gameType} ${b.value === 'Match' ? 'Match' : b.value}`}
-                    </span>
-                    {canDelete && (
-                      <button 
-                        onClick={handleDeleteLastBid} 
-                        className="text-slate-400 hover:text-red-600 hover:bg-red-50 p-1.5 rounded transition-colors -mr-1"
-                        title="Gebot löschen"
-                      >
-                        <Trash2 size={16} />
-                      </button>
-                    )}
-                  </div>
-                </div>
-              );
-            })
-          )}
+      {!isConnected && (
+        <div className="mx-3.5 mb-2 px-3.5 py-2.5 rounded-xl bg-danger-bg text-danger-ink text-sm font-semibold flex items-center gap-2.5 shrink-0">
+          <WifiOff size={18} /> Verbindung unterbrochen – verbinde neu …
         </div>
+      )}
+
+      {/* Höchstgebot */}
+      <div className={`mx-3.5 px-4 py-3 rounded-[20px] flex items-center gap-4 shrink-0 transition-colors ${banner.style}`}>
+        {banner.icon && (
+          <div className="w-[50px] h-[50px] rounded-[15px] bg-white flex items-center justify-center shrink-0">
+            <img src={banner.icon} alt="" className="w-[30px] h-[30px] object-contain" />
+          </div>
+        )}
+        <div className="flex flex-col gap-0.5 min-w-0">
+          <span className="text-xs font-bold uppercase tracking-[0.08em] opacity-85">{banner.overline}</span>
+          <span className="num text-[26px] font-extrabold leading-tight">{banner.title}</span>
+          <span className="text-sm opacity-90">{banner.sub}</span>
+        </div>
+      </div>
+
+      {/* Spieler mit allen ihren Geboten */}
+      <div className="flex-1 min-h-0 overflow-y-auto px-3.5 py-2.5 flex flex-col gap-1.5">
+        {game.players.map(p => {
+          const tags = [p.id === playerId && 'Du', p.id === starterId && 'beginnt'].filter(Boolean).join(' · ');
+          const onTurn = turn?.id === p.id;
+          const chips = game.bids.map((b, i) => ({ b, n: i + 1 })).filter(({ b }) => b.playerId === p.id);
+          return (
+            <div
+              key={p.id}
+              className={`flex items-start gap-2 px-2.5 py-2 rounded-[14px] border-[1.5px] transition-colors duration-500 ${flashId === p.id ? 'bg-flash' : 'bg-white'} ${onTurn ? 'border-accent ring-2 ring-accent/25' : 'border-line'}`}
+            >
+              <div className="w-[100px] shrink-0 flex items-center gap-2 min-h-[30px]">
+                <Avatar name={p.name} size="sm" />
+                <div className="min-w-0 flex flex-col leading-tight">
+                  <span className="font-bold text-[15px] truncate">{p.name}</span>
+                  {tags && <span className="text-[11px] text-muted whitespace-nowrap">{tags}</span>}
+                </div>
+              </div>
+              <div className="flex-1 min-w-0 flex flex-wrap gap-1 items-center min-h-[30px]">
+                {chips.length === 0 && !onTurn && <span className="text-[13px] text-muted">noch kein Gebot</span>}
+                {chips.map(({ b, n }) => {
+                  const lead = best === b;
+                  const isPass = b.value === 'Pass';
+                  return (
+                    <span
+                      key={n}
+                      aria-label={`Gebot ${n}: ${bidLabel(b)}`}
+                      className={`num h-7 inline-flex items-center gap-1 pl-1.5 pr-2 rounded-lg border text-[13px] font-bold whitespace-nowrap ${
+                        isPass ? 'bg-ground border-ground text-muted'
+                        : lead ? 'bg-accent-soft border-accent text-accent-ink'
+                        : 'bg-white border-line-strong text-ink'}`}
+                    >
+                      <span className="text-[10px] font-semibold opacity-70">{n}</span>
+                      {!isPass && <img src={suitIcon(b.gameType)} alt={b.gameType} className="w-[15px] h-[15px] object-contain" />}
+                      {formatValue(b.value)}
+                    </span>
+                  );
+                })}
+                {onTurn && (
+                  <span className="h-7 inline-flex items-center px-2 rounded-lg bg-accent text-white text-[12px] font-bold whitespace-nowrap">
+                    {p.id === playerId ? 'Du bist dran' : 'am Zug'}
+                  </span>
+                )}
+              </div>
+            </div>
+          );
+        })}
+        <span className="text-xs text-muted text-center py-1">
+          Geboten wird reihum von oben nach unten. Die kleine Zahl zeigt die Reihenfolge der Gebote. Gespielt wird ab {MIN_PLAY_VALUE}.
+        </span>
+      </div>
+
+      {/* Bedienfeld in der Daumenzone */}
+      <div className="shrink-0 bg-white border-t border-line rounded-t-3xl px-3.5 pt-3 pb-[calc(1.5rem+env(safe-area-inset-bottom))] flex flex-col gap-2 shadow-[0_-6px_20px_rgba(22,32,28,0.06)]">
+        {myTurn ? (
+          <>
+            <div className="flex items-center gap-2.5">
+              <button onClick={() => step(-1)} disabled={valueIndex <= 0} aria-label="Wert verringern" className="press w-[52px] h-12 rounded-[14px] border-[1.5px] border-line-strong bg-white text-ink disabled:text-line-strong flex items-center justify-center">
+                <Minus size={24} strokeWidth={2.4} />
+              </button>
+              <div className="flex-1 flex flex-col items-center leading-none">
+                <span className="num text-[32px] font-extrabold">{value === null ? '–' : formatValue(value)}</span>
+                <span className="text-xs text-muted mt-1">
+                  {value === 'Match' ? 'alle Stiche (157)' : valueIndex === 0 ? 'nächstmöglicher Wert' : 'Wert gewählt'}
+                </span>
+              </div>
+              <button onClick={() => step(1)} disabled={valueIndex < 0 || valueIndex >= allowed.length - 1} aria-label="Wert erhöhen" className="press w-[52px] h-12 rounded-[14px] border-[1.5px] border-line-strong bg-white text-ink disabled:text-line-strong flex items-center justify-center">
+                <Plus size={24} strokeWidth={2.4} />
+              </button>
+            </div>
+            <div className="grid grid-cols-3 gap-2">
+              {SUITS.map(s => (
+                <button
+                  key={s.type}
+                  onClick={() => placeBid(s.type)}
+                  disabled={!isConnected || value === null}
+                  style={isConnected ? { background: s.tint, borderColor: s.border } : undefined}
+                  className="press h-14 rounded-[14px] border-[1.5px] border-line bg-ground disabled:opacity-50 flex flex-col items-center justify-center gap-1 text-sm font-bold"
+                >
+                  <img src={s.icon} alt="" className="w-[22px] h-[22px] object-contain" />
+                  {s.type}
+                </button>
+              ))}
+            </div>
+            <button onClick={pass} disabled={!isConnected} className="press h-12 rounded-[14px] bg-neutral-btn disabled:opacity-50 text-[17px] font-bold">
+              Ich passe
+            </button>
+          </>
+        ) : (
+          <div className="flex flex-col items-center gap-3 pt-2 pb-1">
+            <span className="text-[17px] font-bold text-center">
+              {over ? (played ? 'Bietrunde beendet' : 'Nicht gespielt')
+                : myLast ? (myLast.value === 'Pass' ? 'Du hast gepasst' : `Du hast ${bidLabel(myLast)} geboten`)
+                : `${turn?.name ?? 'Jemand anderes'} ist am Zug`}
+            </span>
+            <span className="text-[15px] text-muted text-center">
+              {over
+                ? (isCreator ? 'Starte die nächste Runde, wenn ihr bereit seid.' : `Warte auf ${creatorName} für die nächste Runde.`)
+                : `Vor dir: ${beforeMe.join(', ')}`}
+            </span>
+            {canUndo && (
+              <>
+                <button onClick={undoAndEdit} disabled={!isConnected} className="press w-full h-[52px] rounded-[14px] border-[1.5px] border-accent bg-white text-accent-ink text-[17px] font-bold flex items-center justify-center gap-2.5 disabled:opacity-50">
+                  <Undo2 size={20} /> Zurücknehmen und neu setzen
+                </button>
+                <span className="text-xs text-muted text-center">Möglich, bis die nächste Person geboten oder gepasst hat.</span>
+              </>
+            )}
+            {over && isCreator && (
+              <button onClick={() => socket?.emit('newRound')} className="press w-full h-14 rounded-[14px] bg-accent text-white text-[17px] font-bold flex items-center justify-center gap-2.5">
+                <RotateCcw size={20} /> Neue Runde starten
+              </button>
+            )}
+          </div>
+        )}
       </div>
     </div>
   );
 };
 
+// --- Menü im Spiel ---
+const MenuSheet = ({ isCreator, onNewRound, onInvite, onLeave, onClose }: {
+  isCreator: boolean; onNewRound: () => void; onInvite: () => void; onLeave: () => void; onClose: () => void;
+}) => {
+  const [confirmLeave, setConfirmLeave] = useState(false);
+  const item = 'press h-14 rounded-[14px] text-[17px] font-semibold flex items-center gap-3.5 px-4';
+  return (
+    <BottomSheet label="Menü" onClose={onClose}>
+      <div className="flex flex-col gap-1.5">
+        {isCreator && (
+          <button onClick={onNewRound} className={`${item} bg-neutral-soft`}><RotateCcw size={22} /> Neue Bietrunde</button>
+        )}
+        <button onClick={onInvite} className={`${item} bg-neutral-soft`}><UserPlus size={22} /> Spieler einladen</button>
+        <button onClick={() => (confirmLeave ? onLeave() : setConfirmLeave(true))} className={`${item} bg-danger-bg text-danger-ink`}>
+          <LogOut size={22} /> {confirmLeave ? 'Wirklich verlassen? Nochmals tippen' : 'Spiel verlassen'}
+        </button>
+      </div>
+    </BottomSheet>
+  );
+};
+
+// --- App ---
 export default function App() {
   const [game, setGame] = useState<Game | null>(null);
   const [playerId, setPlayerId] = useState<string | null>(null);
-  const [error, setError] = useState<string | null>(null);
   const [isConnected, setIsConnected] = useState(false);
+  const [sheet, setSheet] = useState<'invite' | 'menu' | null>(null);
+  const [toast, setToast] = useState<Toast | null>(null);
   const socketRef = useRef<Socket | null>(null);
+  const toastTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  const showToast = useCallback<ShowToast>((text) => {
+    if (toastTimer.current) clearTimeout(toastTimer.current);
+    setToast({ id: Date.now(), text });
+    toastTimer.current = setTimeout(() => setToast(null), 3000);
+  }, []);
+
+  const resetSession = useCallback(() => {
+    SESSION_KEYS.forEach(k => writeStorage(session, k, null));
+    setGame(null);
+    setPlayerId(null);
+    setSheet(null);
+  }, []);
 
   useEffect(() => {
     const socket = io();
     socketRef.current = socket;
 
     socket.on('connect', () => {
-      console.log('Socket.io connected');
       setIsConnected(true);
-
-      const savedPlayerId = sessionStorage.getItem('sidibarrani_playerId');
-      const savedGameCode = sessionStorage.getItem('sidibarrani_gameCode');
-      const savedToken = sessionStorage.getItem('sidibarrani_token');
+      const savedPlayerId = readStorage(session, 'sidibarrani_playerId');
+      const savedGameCode = readStorage(session, 'sidibarrani_gameCode');
+      const savedToken = readStorage(session, 'sidibarrani_token');
       if (savedPlayerId && savedGameCode && savedToken) {
         socket.emit('rejoinGame', { gameCode: savedGameCode, playerId: savedPlayerId, token: savedToken });
       }
     });
-    
-    socket.on('disconnect', () => {
-      console.log('Socket.io disconnected');
-      setIsConnected(false);
-    });
 
-    socket.on('gameCreated', (data) => {
+    socket.on('disconnect', () => setIsConnected(false));
+
+    const onEnter = (data: { game: Game; playerId: string; token: string }) => {
       setGame(data.game);
       setPlayerId(data.playerId);
-      sessionStorage.setItem('sidibarrani_playerId', data.playerId);
-      sessionStorage.setItem('sidibarrani_gameCode', data.game.gameCode);
-      sessionStorage.setItem('sidibarrani_token', data.token);
-      setError(null);
-    });
+      writeStorage(session, 'sidibarrani_playerId', data.playerId);
+      writeStorage(session, 'sidibarrani_gameCode', data.game.gameCode);
+      writeStorage(session, 'sidibarrani_token', data.token);
+    };
+    socket.on('gameCreated', onEnter);
+    socket.on('gameJoined', onEnter);
+    socket.on('gameStateUpdate', (data: { game: Game }) => setGame(data.game));
 
-    socket.on('gameJoined', (data) => {
-      setGame(data.game);
-      setPlayerId(data.playerId);
-      sessionStorage.setItem('sidibarrani_playerId', data.playerId);
-      sessionStorage.setItem('sidibarrani_gameCode', data.game.gameCode);
-      sessionStorage.setItem('sidibarrani_token', data.token);
-      setError(null);
-    });
-
-    socket.on('gameStateUpdate', (data) => {
-      setGame(data.game);
-    });
-
-    socket.on('error', (data) => {
-      setError(data.message);
-      if (data.message === 'Game not found' || data.message === 'Player not found in game') {
-        sessionStorage.removeItem('sidibarrani_playerId');
-        sessionStorage.removeItem('sidibarrani_gameCode');
-        sessionStorage.removeItem('sidibarrani_token');
-        setGame(null);
-        setPlayerId(null);
-      }
+    socket.on('error', (data: { message: string }) => {
+      showToast(ERROR_TEXT[data.message] ?? 'Etwas ist schiefgelaufen');
+      if (SESSION_ERRORS.includes(data.message)) resetSession();
     });
 
     return () => {
       socket.disconnect();
     };
-  }, []);
+  }, [showToast, resetSession]);
 
-  if (error) {
-    // Simple error display, could be a toast notification
-    alert(error);
-    setError(null);
-  }
+  // Bildschirm während des Spiels wach halten
+  const inGame = !!game?.started;
+  useEffect(() => {
+    if (!inGame || !('wakeLock' in navigator)) return;
+    let lock: WakeLockSentinel | null = null;
+    const request = async () => {
+      try {
+        if (document.visibilityState === 'visible') lock = await navigator.wakeLock.request('screen');
+      } catch { /* z.B. Energiesparmodus */ }
+    };
+    request();
+    document.addEventListener('visibilitychange', request);
+    return () => {
+      document.removeEventListener('visibilitychange', request);
+      lock?.release().catch(() => {});
+    };
+  }, [inGame]);
 
+  const closeSheet = useCallback(() => setSheet(null), []);
+
+  const leave = () => {
+    socketRef.current?.emit('leaveGame');
+    resetSession();
+  };
+
+  const socket = socketRef.current;
+  let page: ReactNode;
   if (!game || !playerId) {
-    return <HomePage socket={socketRef.current} setPlayerId={setPlayerId} setGame={setGame} isConnected={isConnected} />;
+    page = <HomePage socket={socket} isConnected={isConnected} />;
+  } else if (!game.started) {
+    page = <LobbyPage game={game} playerId={playerId} socket={socket} onInvite={() => setSheet('invite')} onLeave={leave} />;
+  } else {
+    page = (
+      <GamePage
+        game={game} playerId={playerId} socket={socket} isConnected={isConnected}
+        onInvite={() => setSheet('invite')} onMenu={() => setSheet('menu')}
+      />
+    );
   }
 
-  return <GamePage game={game} playerId={playerId} socket={socketRef.current} />;
+  return (
+    <div className="font-sans text-ink">
+      {page}
+
+      <div aria-live="polite" className="fixed top-[68px] inset-x-0 z-30 px-3.5 pointer-events-none">
+        {toast && (
+          <div key={toast.id} role="status" className="mx-auto max-w-md min-h-[52px] px-4 py-3 rounded-2xl bg-ink text-white flex items-center shadow-[0_10px_30px_rgba(0,0,0,0.25)]">
+            <span className="text-[15px] font-semibold">{toast.text}</span>
+          </div>
+        )}
+      </div>
+
+      {game && sheet === 'invite' && (
+        <InviteSheet gameCode={game.gameCode} onClose={closeSheet} showToast={showToast} />
+      )}
+      {game && playerId && sheet === 'menu' && (
+        <MenuSheet
+          isCreator={game.creatorId === playerId}
+          onNewRound={() => { socket?.emit('newRound'); setSheet(null); showToast('Neue Bietrunde gestartet'); }}
+          onInvite={() => setSheet('invite')}
+          onLeave={leave}
+          onClose={closeSheet}
+        />
+      )}
+    </div>
+  );
 }
