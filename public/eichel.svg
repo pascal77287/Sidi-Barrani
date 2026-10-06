@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="100" height="100">
+  <!-- Eichel-Kappe -->
+  <path d="M6 10C6 6.5 8.5 5 12 5C15.5 5 18 6.5 18 10C18 10.5 17.5 11 17 11H7C6.5 11 6 10.5 6 10Z" fill="#A0522D" stroke="#5C2E16" stroke-width="1.5" stroke-linejoin="round"/>
+  <!-- Kappen-Struktur (Gitter) -->
+  <path d="M9 5L12 11M15 5L12 11M12 5V11" stroke="#5C2E16" stroke-width="1" opacity="0.4"/>
+  <!-- Eichel-Körper -->
+  <path d="M7 11C7 14.5 9.5 18 12 19C14.5 18 17 14.5 17 11H7Z" fill="#FFB84D" stroke="#D47A00" stroke-width="1.5" stroke-linejoin="round"/>
+  <!-- Kleiner Stiel -->
+  <path d="M12 5V2" stroke="#5C2E16" stroke-width="1.5" stroke-linecap="round"/>
+</svg>
