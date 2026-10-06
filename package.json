@@ -4,7 +4,7 @@
   "version": "0.0.0",
   "type": "module",
   "scripts": {
-    "dev": "tsx server.ts",
+    "dev": "tsx server.ts --dev",
     "build": "vite build && tsc -p tsconfig.server.json",
     "start": "node dist/server.js",
     "preview": "vite preview",
@@ -37,5 +37,8 @@
     "tsx": "^4.21.0",
     "typescript": "~5.8.2",
     "vite": "^6.2.0"
+  },
+  "overrides": {
+    "qs": "^6.16.0"
   }
 }

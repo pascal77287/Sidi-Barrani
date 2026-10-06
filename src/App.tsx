@@ -6,7 +6,7 @@ import { useState, useEffect, useRef } from 'react';
 import { io, Socket } from 'socket.io-client';
 import { QRCodeSVG } from 'qrcode.react';
 import { Share2, X, RotateCcw, Trash2 } from 'lucide-react';
-import { Suit, SpecialGameType, GameType, Bid } from './types';
+import { Suit, SpecialGameType, GameType } from './types';
 import type { Game, BidValue } from './types';
 
 const HomePage = ({ socket, setPlayerId, setGame, isConnected }: {
@@ -77,6 +77,7 @@ const HomePage = ({ socket, setPlayerId, setGame, isConnected }: {
               value={playerName}
               onChange={(e) => setPlayerName(e.target.value)}
               placeholder="Dein Name"
+              maxLength={20}
               className="w-full p-3 border border-slate-300 rounded-lg mb-4 focus:ring-1 focus:ring-slate-900 focus:border-slate-900 outline-none transition-all"
               autoFocus
             />
@@ -104,6 +105,7 @@ const HomePage = ({ socket, setPlayerId, setGame, isConnected }: {
               value={playerName}
               onChange={(e) => setPlayerName(e.target.value)}
               placeholder="Dein Name"
+              maxLength={20}
               className="w-full p-3 border border-slate-300 rounded-lg mb-4 focus:ring-1 focus:ring-slate-900 focus:border-slate-900 outline-none transition-all"
               autoFocus
             />
@@ -141,7 +143,7 @@ const GamePage = ({ game, playerId, socket }: { game: Game, playerId: string, so
 
   const handleStartGame = () => {
     if (socket) {
-      socket.emit('startGame', { gameCode: game.gameCode });
+      socket.emit('startGame');
     }
   };
 
@@ -243,20 +245,20 @@ const GamePage = ({ game, playerId, socket }: { game: Game, playerId: string, so
 };
 
 const BiddingComponent = ({ game, playerId, socket }: { game: Game, playerId: string, socket: Socket | null }) => {
-  const [bidValue, setBidValue] = useState<number | 'Match'>('');
+  const [bidValue, setBidValue] = useState<number | 'Match' | ''>('');
   const [errorMsg, setErrorMsg] = useState('');
 
   const isCreator = game.creatorId === playerId;
 
   const handleNewRound = () => {
     if (socket) {
-      socket.emit('newRound', { gameCode: game.gameCode });
+      socket.emit('newRound');
     }
   };
 
   const handleDeleteLastBid = () => {
     if (socket) {
-      socket.emit('deleteLastBid', { gameCode: game.gameCode, playerId });
+      socket.emit('deleteLastBid');
     }
   };
 
@@ -300,14 +302,9 @@ const BiddingComponent = ({ game, playerId, socket }: { game: Game, playerId: st
     if (!socket) return;
     setErrorMsg('');
 
+    // Spieler und Spiel ermittelt der Server aus der Verbindung
     if (type === 'Pass') {
-      const passBid: Bid = {
-        playerId,
-        playerName: game.players.find(p => p.id === playerId)?.name || 'Unknown',
-        gameType: Suit.ROSEN, // Dummy suit for Pass
-        value: 'Pass',
-      };
-      socket.emit('placeBid', { gameCode: game.gameCode, bid: passBid });
+      socket.emit('placeBid', { value: 'Pass' });
       return;
     }
 
@@ -316,14 +313,7 @@ const BiddingComponent = ({ game, playerId, socket }: { game: Game, playerId: st
       return;
     }
 
-    const bid: Bid = {
-      playerId,
-      playerName: game.players.find(p => p.id === playerId)?.name || 'Unknown',
-      gameType: type,
-      value: bidValue,
-    };
-
-    socket.emit('placeBid', { gameCode: game.gameCode, bid });
+    socket.emit('placeBid', { gameType: type, value: bidValue });
   };
 
   const getSuitDisplay = (suit: string) => {
@@ -471,8 +461,9 @@ export default function App() {
 
       const savedPlayerId = sessionStorage.getItem('sidibarrani_playerId');
       const savedGameCode = sessionStorage.getItem('sidibarrani_gameCode');
-      if (savedPlayerId && savedGameCode) {
-        socket.emit('rejoinGame', { gameCode: savedGameCode, playerId: savedPlayerId });
+      const savedToken = sessionStorage.getItem('sidibarrani_token');
+      if (savedPlayerId && savedGameCode && savedToken) {
+        socket.emit('rejoinGame', { gameCode: savedGameCode, playerId: savedPlayerId, token: savedToken });
       }
     });
     
@@ -486,6 +477,7 @@ export default function App() {
       setPlayerId(data.playerId);
       sessionStorage.setItem('sidibarrani_playerId', data.playerId);
       sessionStorage.setItem('sidibarrani_gameCode', data.game.gameCode);
+      sessionStorage.setItem('sidibarrani_token', data.token);
       setError(null);
     });
 
@@ -494,6 +486,7 @@ export default function App() {
       setPlayerId(data.playerId);
       sessionStorage.setItem('sidibarrani_playerId', data.playerId);
       sessionStorage.setItem('sidibarrani_gameCode', data.game.gameCode);
+      sessionStorage.setItem('sidibarrani_token', data.token);
       setError(null);
     });
 
@@ -506,6 +499,7 @@ export default function App() {
       if (data.message === 'Game not found' || data.message === 'Player not found in game') {
         sessionStorage.removeItem('sidibarrani_playerId');
         sessionStorage.removeItem('sidibarrani_gameCode');
+        sessionStorage.removeItem('sidibarrani_token');
         setGame(null);
         setPlayerId(null);
       }
